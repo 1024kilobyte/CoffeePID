@@ -4,6 +4,5 @@
     "wifi_client_password": "",
     "wifi_ap_ssid": "CoffeePID",
     "wifi_ap_password": "coffeepid",
-    "target_temp": 96.0,
-    "boiler_offset": 0.0
+    "target_temp": 98.0
 }

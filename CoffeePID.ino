@@ -59,7 +59,17 @@ int loopCounter = 0;
 // configuration values
 String global_preferred_wifi_mode;
 String global_wifi_client_ssid, global_wifi_client_password, global_wifi_ap_ssid, global_wifi_ap_password;
-float global_target_temp, global_boiler_offset, global_current_temp;
+float global_target_temp, global_current_temp;
+
+float temp_history[5];
+int current_history_index = 0;
+
+bool initial_heat_up = false;
+float heating_start_delta = 0;
+double correction_value = 0;
+unsigned long correction_value_timestamp = 0;
+
+unsigned long next_action_time = 0;
 
 // *********
 // * SETUP *
@@ -82,7 +92,6 @@ void setup() {
   Serial.println("  WiFi Client | SSID: " + global_wifi_client_ssid + " | Length: " + global_wifi_client_ssid.length());
   Serial.println("  Password: " + global_wifi_client_password + " | Length: " + global_wifi_client_password.length());
   Serial.println("  Brewing Temp: " + String(global_target_temp));
-  Serial.println("  Boiler Offset: " + String(global_boiler_offset));
 
   if (global_preferred_wifi_mode == "client") {
     if (global_wifi_client_ssid.length() > 0 && global_wifi_client_password.length() > 0) {
@@ -200,9 +209,36 @@ void setup() {
 // * MAIN LOOP *
 // *************
 void loop() {
+  // *******
+  // STANDBY - after 30 minutes esp runtime
+  // *******
+  if (millis() > 1800000) {
+    if (isHeating) {
+        isHeating = false;
+        digitalWrite(relayPin, LOW);
+
+        Serial.println("Maximum power on timer elapsed, machine going into standby.");
+    }
+
+    // blink the heater light to signal standby mode
+    if (loopCounter % 10000000) {
+        Serial.println("blink");
+        digitalWrite(relayPin, HIGH);
+        delay(150);
+        digitalWrite(relayPin, LOW);
+        delay(150);
+        digitalWrite(relayPin, HIGH);
+        delay(150);
+        digitalWrite(relayPin, LOW);
+    }
+
+    // reset loop counter
+    loopCounter = 0;
+  }
+  // *********
   // SLOW LOOP - as the heating is relatively slow, we don't need to measure with every loop cycle
   // *********
-  if (loopCounter % 30000 == 0) {
+  else if (loopCounter % 10000 == 0) {
     // check and print any faults
     uint8_t fault = ptThermo.readFault();
     if (fault) {
@@ -229,40 +265,100 @@ void loop() {
     }
     
     // check temperature
-    float current_temp_reading = ptThermo.temperature(PT1000_RNOM, PT1000_RREF);
-    global_current_temp = current_temp_reading - global_boiler_offset;
+    global_current_temp = ptThermo.temperature(PT1000_RNOM, PT1000_RREF);
+
+    temp_history[current_history_index] = global_current_temp;
+    current_history_index = current_history_index + 1;
+    current_history_index = current_history_index % 5;
     
-    // Serial.println(String(global_current_temp));
-    
+    Serial.println(String(global_current_temp));
+
     // fast exit for overheating
-    if (current_temp_reading >= 165 && isHeating) {
+    if ((global_current_temp > 130 || global_current_temp > global_target_temp) && isHeating) {
+      isHeating = false;
       digitalWrite(relayPin, LOW);
 
       Serial.println("Over temperature protection active");
+      next_action_time = millis() + 15000;
     } else {
-      // check for heating
-      if (global_current_temp < global_target_temp) {
-        if (!isHeating) {
-          isHeating = true;
-          digitalWrite(relayPin, HIGH);
+      if (millis() > next_action_time) {
+        // get incline of the temp curve
+        float oldest_history_value, latest_history_value; 
 
-          Serial.println(String(global_current_temp) + "°C, below brewing temp, switching on");
+        if (current_history_index == 0) {
+          latest_history_value = temp_history[4];
+        } else {
+          latest_history_value = temp_history[current_history_index - 1];
         }
-      // check for cooling
-      } else {
+
+        oldest_history_value = temp_history[current_history_index];
+
+        float delta_temp = latest_history_value - oldest_history_value;
+
         if (isHeating) {
           isHeating = false;
           digitalWrite(relayPin, LOW);
 
-          Serial.println(String(global_current_temp) + "°C, reached brew temp, switching off");
+          // Serial.println(String(global_current_temp) + "°C, switching off");
+
+          // lets wait for the system to relax (5s)
+          next_action_time = millis() + 5000;
+        } else if (!isHeating) {
+          // let the system relax to get a better value
+          if (correction_value == 0 && initial_heat_up) {
+            if (delta_temp <= 0) {
+              // the times two part is totally based on testing 
+              correction_value = 1 + ((global_target_temp - global_current_temp) / heating_start_delta) * 5;
+              correction_value_timestamp = millis();
+
+              Serial.println(String(correction_value));
+
+              if (correction_value < 1) {
+                correction_value = 1;  
+              }
+            }
+          } else if (global_current_temp < global_target_temp) {
+            heating_start_delta = global_target_temp - global_current_temp;
+
+            double tmp_correction_value = 1;
+
+            if (correction_value != 0 && correction_value != 1) {
+              // reduce the correction value depending on time
+              double corrected_correction_value = correction_value - ((millis() - correction_value_timestamp) * 0.000005);
+              if (corrected_correction_value < 1) {
+                // tmp value is already 1
+                Serial.println("reached correction of 1");
+                correction_value = 1;
+              } else {
+                tmp_correction_value = corrected_correction_value;  
+              }
+            }
+
+            double heating_duration = tmp_correction_value * (heating_start_delta * 700 + delta_temp * -8600);
+
+            // skip heating if it is to short
+            if (heating_duration > 100) {
+              if (!initial_heat_up) {
+                initial_heat_up = true;  
+              }
+              
+              isHeating = true;
+              digitalWrite(relayPin, HIGH);
+              
+              next_action_time = millis() + heating_duration; 
+            } else {
+              // Serial.println("skipping short heating due to relaxation time");  
+            }
+          }
         }
-      } 
+      }
     }
 
     // reset loop counter
     loopCounter = 0;
   }
 
+  // *********
   // FAST LOOP - execute with every loop cycle
   // *********
   // help the esp to do its other tasks (wifi connections, aso.)
@@ -336,11 +432,11 @@ void handleWebRequests() {
 // * AJAX ENDPOINTS *
 // ******************
 void getTemp() {
-  server.send(200, "text/plain", String(global_target_temp) + "|" + String(global_boiler_offset) + "|" + String(global_current_temp));
+  server.send(200, "text/plain", String(global_target_temp) + "|" + String(global_current_temp) + "|" + String(isHeating));
 }
 
 void getConfig() {
-  server.send(200, "text/json", "{ \"preferred_wifi_mode\": \"" + String(global_preferred_wifi_mode) + "\", \"wifi_ap_ssid\": \"" + String(global_wifi_ap_ssid) + "\", \"wifi_ap_password\": \"" + String(global_wifi_ap_password) + "\", \"wifi_client_ssid\": \"" + String(global_wifi_client_ssid) + "\", \"target_temp\": \"" + String(global_target_temp) + "\", \"boiler_offset\": \"" + String(global_boiler_offset) + "\" }");
+  server.send(200, "text/json", "{ \"preferred_wifi_mode\": \"" + String(global_preferred_wifi_mode) + "\", \"wifi_ap_ssid\": \"" + String(global_wifi_ap_ssid) + "\", \"wifi_ap_password\": \"" + String(global_wifi_ap_password) + "\", \"wifi_client_ssid\": \"" + String(global_wifi_client_ssid) + "\", \"target_temp\": \"" + String(global_target_temp) + "\" }");
 }
 
 void setConfig() {
@@ -381,10 +477,8 @@ void setConfig() {
   }
 
   String target_temp = server.arg("target_temp");
-  String boiler_offset = server.arg("boiler_offset");
-  if (target_temp.length() > 0 && boiler_offset.length() > 0) {
+  if (target_temp.length() > 0) {
     global_target_temp = target_temp.toFloat();
-    global_boiler_offset = boiler_offset.toFloat();
   }
 
   writeConfig();
@@ -436,7 +530,7 @@ void readConfig() {
   LittleFS.begin();
 
   if (LittleFS.exists("/config.json")) {
-    File config_file = LittleFS.open("/config.json", "r"); // Datei zum lesen öffnen;
+    File config_file = LittleFS.open("/config.json", "r");
 
     DynamicJsonDocument doc(512);
     deserializeJson(doc, config_file.readString());
@@ -449,7 +543,6 @@ void readConfig() {
     global_wifi_ap_ssid = (const char *) doc["wifi_ap_ssid"];
     global_wifi_ap_password = (const char *) doc["wifi_ap_password"];
     global_target_temp = (float) doc["target_temp"];
-    global_boiler_offset = (float) doc["boiler_offset"];
   }
 }
 
@@ -461,7 +554,6 @@ void writeConfig() {
   doc["wifi_ap_ssid"] = global_wifi_ap_ssid;
   doc["wifi_ap_password"] = global_wifi_ap_password;
   doc["target_temp"] = global_target_temp;
-  doc["boiler_offset"] = global_boiler_offset;
 
   LittleFS.begin();
 

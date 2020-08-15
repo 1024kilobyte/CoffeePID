@@ -74,10 +74,6 @@ function initSettings() {
         postSettings('temp');
     });
 
-    $('#inputTargetTemp, #inputBoilerDelta').on('change', function (event) {
-        $('#boilderTargetTemp').html(String(Number($('#inputBoilerDelta').val()) + Number($('#inputTargetTemp').val())));
-    });
-
     $('#inputClientPassword').on('input', function (event) {
         var currentValue = $('#inputClientPassword').val();
 
@@ -126,9 +122,6 @@ function initSettings() {
             $('#inputApPassword').val(responseData.wifi_ap_password);
 
             $('#inputTargetTemp').val(Number(responseData.target_temp));
-            $('#inputBoilerDelta').val(Number(responseData.boiler_offset));
-
-            $('#boilderTargetTemp').html(String(Number(responseData.target_temp) + Number(responseData.boiler_offset)));
         }
     });
 }
@@ -217,7 +210,6 @@ function postSettings(section) {
             break;
         case 'temp':
             dataString += 'target_temp=' + $('#inputTargetTemp').val();
-            dataString += '&boiler_offset=' + $('#inputBoilerDelta').val();
             break;
         case 'reboot':
             dataString += 'reboot=true';
@@ -232,9 +224,12 @@ function postSettings(section) {
         url: '/ajax_set_settings',
         data: dataString,
         success : function(text) {
+            // as the user may want to reboot additionally, don't redirect automatically
+            /*
             if (section != 'change_wifi_mode') {
                 window.location.hash = '#home';
             }
+            */
         }
     });
 }
@@ -242,31 +237,29 @@ function postSettings(section) {
 // *********************
 // ******* HOME ********
 // *********************
-function updateHomeTemp(){
+function updateHomeTemp() {
     $.ajax({
         type: "GET",
         url: "/ajax_get_temp",
         success : function(tempString){
             var resultComponents = tempString.split('|');
 
-            // TODO: extend by boiler offset
-            // var boilerTempOffset = Number(resultComponents[1]);
-
-            var currentTemperature = Number(resultComponents[2]);
+            var currentTemperature = Number(resultComponents[1]);
             $('#currentTemp').html(currentTemperature.toFixed(1));
 
-            var targetTemperature = Number(resultComponents[0]);
-            $('#state-circle').removeClass('heating-off');
+            // not needed for now
+            // var targetTemperature = Number(resultComponents[0]);
+
             $('#state-circle').removeClass('heating-on');
             $('#state-circle').removeClass('cool-off');
 
-            if (currentTemperature < targetTemperature) {
+            // be aware: boolean(string) is always true
+            var isHeating = Boolean(Number(resultComponents[2]));
+
+            if (isHeating) {
                 $('#state-circle').addClass('heating-on');
-            // if the temperature is more than 2 degrees to high, let the machine cool off
-            } else if (currentTemperature > targetTemperature + 2) {
-                $('#state-circle').addClass('cool-off');
             } else {
-                $('#state-circle').addClass('temp-ok');
+                $('#state-circle').addClass('cool-off');
             }
         },
         error: function() {
