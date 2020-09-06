@@ -13,7 +13,7 @@
  * - an 3,3 V power supply for the esp
  * 
  * Author   : @1024kilobyte
- * Version  : 0.1
+ * Version  : 1.1
  */
 
 // wifi stuff
@@ -34,9 +34,12 @@
 // MAX31865 library
 #include <Adafruit_MAX31865.h>
 
-// constants
+// pt1000 constants
 #define PT1000_RNOM     1000.0
 #define PT1000_RREF     4300.0
+
+// standby after 30 minutes
+#define STANDBY_TIMEOUT 1800000
 
 // declare webserver instance
 ESP8266WebServer server(80);
@@ -52,23 +55,21 @@ int maxCS = 4;   // D2
 // declare max31865 instance
 Adafruit_MAX31865 ptThermo = Adafruit_MAX31865(maxCS, maxSDI, maxSDO, maxCLK);
 
-// internal program variables
+// internal state variables
 bool isHeating = false;
-int loopCounter = 0;
+bool isStandby = false;
 
 // configuration values
 String global_preferred_wifi_mode;
 String global_wifi_client_ssid, global_wifi_client_password, global_wifi_ap_ssid, global_wifi_ap_password;
 float global_target_temp, global_current_temp;
 
+// temp history buffer
 float temp_history[5];
 int current_history_index = 0;
 
-bool initial_heat_up = false;
-float heating_start_delta = 0;
-double correction_value = 0;
-unsigned long correction_value_timestamp = 0;
-
+// loop control timestamps
+unsigned long measure_time = 0;
 unsigned long next_action_time = 0;
 
 // *********
@@ -209,39 +210,20 @@ void setup() {
 // * MAIN LOOP *
 // *************
 void loop() {
-  // *******
-  // STANDBY - after 30 minutes esp runtime
-  // *******
-  if (millis() > 1800000) {
-    if (isHeating) {
-        isHeating = false;
-        digitalWrite(relayPin, LOW);
-
-        Serial.println("Maximum power on timer elapsed, machine going into standby.");
-    }
-
-    // blink the heater light to signal standby mode
-    if (loopCounter % 10000000) {
-        Serial.println("blink");
-        digitalWrite(relayPin, HIGH);
-        delay(150);
-        digitalWrite(relayPin, LOW);
-        delay(150);
-        digitalWrite(relayPin, HIGH);
-        delay(150);
-        digitalWrite(relayPin, LOW);
-    }
-
-    // reset loop counter
-    loopCounter = 0;
-  }
-  // *********
-  // SLOW LOOP - as the heating is relatively slow, we don't need to measure with every loop cycle
-  // *********
-  else if (loopCounter % 10000 == 0) {
+  // ************
+  // TEMP READING - updates the temp value
+  // ************
+  if (millis() > measure_time) {
     // check and print any faults
     uint8_t fault = ptThermo.readFault();
     if (fault) {
+      // deactivate on temp reading error
+      if (!isStandby) {
+        Serial.println("Temperature reading error, machine going into standby.");
+    
+        goIntoStandBy();
+      }
+      
       Serial.print("Fault 0x"); Serial.println(fault, HEX);
       if (fault & MAX31865_FAULT_HIGHTHRESH) {
         Serial.println("RTD High Threshold"); 
@@ -262,104 +244,89 @@ void loop() {
         Serial.println("Under/Over voltage"); 
       }
       ptThermo.clearFault();
+    } else {
+      // get temperature
+      global_current_temp = ptThermo.temperature(PT1000_RNOM, PT1000_RREF);
+  
+      // save value in "ring buffer"
+      temp_history[current_history_index] = global_current_temp;
+      current_history_index = current_history_index + 1;
+      current_history_index = current_history_index % 5;
+      
+      Serial.println(String(global_current_temp));
     }
-    
-    // check temperature
-    global_current_temp = ptThermo.temperature(PT1000_RNOM, PT1000_RREF);
 
-    temp_history[current_history_index] = global_current_temp;
-    current_history_index = current_history_index + 1;
-    current_history_index = current_history_index % 5;
-    
-    Serial.println(String(global_current_temp));
+    measure_time = millis() + 75;
+  }
+  
+  // **********************
+  // OVERHEATING PROTECTION - don't heat past target temp + 3°C or 130°C
+  // **********************
+  if ((global_current_temp > 130 || global_current_temp > (global_target_temp + 3.0)) && isHeating) {
+    isHeating = false;
+    digitalWrite(relayPin, LOW);
 
-    // fast exit for overheating
-    if ((global_current_temp > 130 || global_current_temp > global_target_temp) && isHeating) {
+    Serial.println("Over temperature protection active");
+    next_action_time = millis() + 5000;
+  }
+  
+  // *******
+  // STANDBY - after STANDBY_TIMEOUT esp runtime (in ms)
+  // *******
+  if (!isStandby && millis() > STANDBY_TIMEOUT) {
+    Serial.println("Maximum power on timer elapsed, machine going into standby.");
+    
+    goIntoStandBy();
+  }
+
+  // *******
+  // CONTROL
+  // *******
+  if (millis() > next_action_time) {
+    // get temp incline from buffer
+    float oldest_history_value, latest_history_value; 
+
+    if (current_history_index == 0) {
+      latest_history_value = temp_history[4];
+    } else {
+      latest_history_value = temp_history[current_history_index - 1];
+    }
+
+    oldest_history_value = temp_history[current_history_index];
+
+    float delta_temp = latest_history_value - oldest_history_value;
+
+    // finally control the heater
+    if (isHeating) {
       isHeating = false;
       digitalWrite(relayPin, LOW);
 
-      Serial.println("Over temperature protection active");
-      next_action_time = millis() + 15000;
+      // Serial.println(String(global_current_temp) + "°C, switching off");
+
+      // calculate relaxation time 
+      int relaxationTime = 5000 + delta_temp * 1000;
+      
+      next_action_time = millis() + relaxationTime;
     } else {
-      if (millis() > next_action_time) {
-        // get incline of the temp curve
-        float oldest_history_value, latest_history_value; 
+      float heating_start_delta = global_target_temp - global_current_temp;
+      double heating_duration = heating_start_delta * 1100 + delta_temp * -9000;
 
-        if (current_history_index == 0) {
-          latest_history_value = temp_history[4];
-        } else {
-          latest_history_value = temp_history[current_history_index - 1];
-        }
+      // Serial.println("heating for " + String(heating_duration) + " ms");
 
-        oldest_history_value = temp_history[current_history_index];
-
-        float delta_temp = latest_history_value - oldest_history_value;
-
-        if (isHeating) {
-          isHeating = false;
-          digitalWrite(relayPin, LOW);
-
-          // Serial.println(String(global_current_temp) + "°C, switching off");
-
-          // lets wait for the system to relax (5s)
-          next_action_time = millis() + 5000;
-        } else if (!isHeating) {
-          // let the system relax to get a better value
-          if (correction_value == 0 && initial_heat_up) {
-            if (delta_temp <= 0) {
-              // the times two part is totally based on testing 
-              correction_value = 1 + ((global_target_temp - global_current_temp) / heating_start_delta) * 5;
-              correction_value_timestamp = millis();
-
-              Serial.println(String(correction_value));
-
-              if (correction_value < 1) {
-                correction_value = 1;  
-              }
-            }
-          } else if (global_current_temp < global_target_temp) {
-            heating_start_delta = global_target_temp - global_current_temp;
-
-            double tmp_correction_value = 1;
-
-            if (correction_value != 0 && correction_value != 1) {
-              // reduce the correction value depending on time
-              double corrected_correction_value = correction_value - ((millis() - correction_value_timestamp) * 0.000005);
-              if (corrected_correction_value < 1) {
-                // tmp value is already 1
-                Serial.println("reached correction of 1");
-                correction_value = 1;
-              } else {
-                tmp_correction_value = corrected_correction_value;  
-              }
-            }
-
-            double heating_duration = tmp_correction_value * (heating_start_delta * 700 + delta_temp * -8600);
-
-            // skip heating if it is to short
-            if (heating_duration > 100) {
-              if (!initial_heat_up) {
-                initial_heat_up = true;  
-              }
-              
-              isHeating = true;
-              digitalWrite(relayPin, HIGH);
-              
-              next_action_time = millis() + heating_duration; 
-            } else {
-              // Serial.println("skipping short heating due to relaxation time");  
-            }
-          }
-        }
+      // skip heating if duration is negative or too short
+      if (heating_duration > 150) {              
+        isHeating = true;
+        digitalWrite(relayPin, HIGH);
+        
+        next_action_time = millis() + heating_duration; 
+      } else {
+        // just don't set the next action time and check again in next loop
       }
     }
-
-    // reset loop counter
-    loopCounter = 0;
   }
 
   // *********
-  // FAST LOOP - execute with every loop cycle
+  // FAST LOOP - executed with every loop cycle
   // *********
   // help the esp to do its other tasks (wifi connections, aso.)
   delay(0);
@@ -369,9 +336,6 @@ void loop() {
   
   // handle webserver requests
   server.handleClient();
-
-  // incrementing late makes the program take a temp read on loop 0
-  loopCounter++;
 }
 
 // ******************
@@ -432,7 +396,7 @@ void handleWebRequests() {
 // * AJAX ENDPOINTS *
 // ******************
 void getTemp() {
-  server.send(200, "text/plain", String(global_target_temp) + "|" + String(global_current_temp) + "|" + String(isHeating));
+  server.send(200, "text/plain", String(global_target_temp) + "|" + String(global_current_temp) + "|" + String(isHeating) + "|" + String(millis()) + "|" + String(isStandby));
 }
 
 void getConfig() {
@@ -526,6 +490,18 @@ void getWifis() {
 // **********
 // * HELPER *
 // **********
+void goIntoStandBy() {
+  isStandby = true;
+
+  if (isHeating) {
+    isHeating = false;
+    digitalWrite(relayPin, LOW);
+  }
+
+  // stop heating at all
+  next_action_time = ULONG_MAX;
+}
+
 void readConfig() {
   LittleFS.begin();
 

@@ -18,12 +18,14 @@ function hashChanged(event) {
 }
 
 var updateHomeTempIntervalId = null;
+var updateTimerLabelIntervalId = null;
 
 function route(hash) {
     if (updateHomeTempIntervalId !== null) clearInterval(updateHomeTempIntervalId);
+    if (updateTimerLabelIntervalId !== null) clearInterval(updateTimerLabelIntervalId);
 
     // animate old content -> fade out
-    var oldContent = $('#contentContainer').children(':first');
+    var oldContent = $('#contentContainer').children();
             
     if (oldContent.length > 0) {
         oldContent.fadeOut(200);
@@ -40,9 +42,10 @@ function route(hash) {
                 updateHomeTemp();
                 // and repeat every 750 ms
                 updateHomeTempIntervalId = setInterval(updateHomeTemp, 750);
-                newContent.first().fadeIn(200);
+                // also add timer to update timer label
+                updateTimerLabelIntervalId = setInterval(updateTimerLabel, 1000);
+                newContent.fadeIn(200);
             }, oldContent.length > 0 ? 200 : 0);
-
             break;
         case 'settings':
             newContent = $(getSettingsContent()).hide();
@@ -52,7 +55,6 @@ function route(hash) {
                 initSettings();
                 newContent.first().fadeIn(200);
             }, oldContent.length > 0 ? 200 : 0);
-
             break;
         default:
             window.location.hash = '#home';
@@ -95,8 +97,8 @@ function initSettings() {
     });
 
     $.ajax({
-        type: "GET",
-        url: "/ajax_get_settings",
+        type: 'GET',
+        url: '/ajax_get_settings',
         success : function(responseData) {
             if (responseData.wifi_ap_password.length > 0) {
                 $('#buttonAP').html(responseData.wifi_ap_ssid + ' / ' + responseData.wifi_ap_password);
@@ -136,8 +138,8 @@ function loadWifis() {
     $('#wifiSelectionModal').modal('show');
 
     $.ajax({
-        type: "GET",
-        url: "/ajax_get_wifis",
+        type: 'GET',
+        url: '/ajax_get_wifis',
         success : function(responseData) {
             var modalBody = '';
             
@@ -237,10 +239,14 @@ function postSettings(section) {
 // *********************
 // ******* HOME ********
 // *********************
+var espBootTime = null;
+var espStandBy = false;
+
 function updateHomeTemp() {
     $.ajax({
-        type: "GET",
-        url: "/ajax_get_temp",
+        type: 'GET',
+        url: '/ajax_get_temp',
+        timeout: 2000,
         success : function(tempString){
             var resultComponents = tempString.split('|');
 
@@ -253,7 +259,7 @@ function updateHomeTemp() {
             $('#state-circle').removeClass('heating-on');
             $('#state-circle').removeClass('cool-off');
 
-            // be aware: boolean(string) is always true
+            // isHeating
             var isHeating = Boolean(Number(resultComponents[2]));
 
             if (isHeating) {
@@ -261,9 +267,55 @@ function updateHomeTemp() {
             } else {
                 $('#state-circle').addClass('cool-off');
             }
+
+            // esp uptime
+            if (espBootTime == null) {
+                espBootTime =  new Date(Date.now() - Number(resultComponents[3]));
+
+                $('#timerLabel').prop('hidden', false);
+            }
+
+            // isStandBy
+            var isStandBy = Boolean(Number(resultComponents[4]));
+
+            if (isStandBy != espStandBy) {
+                espStandBy = isStandBy;
+
+                $('#standByLabel').prop('hidden', !espStandBy);
+            }
         },
         error: function() {
-            // TODO
+            // reset on error
+            $('#state-circle').removeClass('heating-on');
+            $('#state-circle').removeClass('cool-off');
+
+            $('#currentTemp').html('--&nbsp;');
+
+            espBootTime = null;
+            espStandBy = false;
+
+            $('#standByLabel').prop('hidden', true);
+            $('#timerLabel').prop('hidden', true);
         }
     });
 }
+
+function updateTimerLabel() {
+    if (espBootTime != null) {
+        var elapsedTime = (Date.now() - espBootTime);
+
+        var timerText = msToTime(elapsedTime);
+
+        $('#timerLabel').html(timerText);
+    }
+}
+
+function msToTime(s) {
+    var ms = s % 1000;
+    s = (s - ms) / 1000;
+    var secs = s % 60;
+    s = (s - secs) / 60;
+    var mins = s;
+  
+    return mins + ':' + ('0' + String(secs)).slice(-2);
+  }
