@@ -213,36 +213,41 @@ void loop() {
   // ************
   // TEMP READING - updates the temp value
   // ************
-  if (millis() > measure_time) {
+  unsigned long current_time = millis();
+
+  if (current_time >= measure_time) {
     // check and print any faults
     uint8_t fault = ptThermo.readFault();
     if (fault) {
-      // deactivate on temp reading error
-      if (!isStandby) {
-        Serial.println("Temperature reading error, machine going into standby.");
-    
-        goIntoStandBy();
-      }
-      
-      Serial.print("Fault 0x"); Serial.println(fault, HEX);
-      if (fault & MAX31865_FAULT_HIGHTHRESH) {
-        Serial.println("RTD High Threshold"); 
-      }
-      if (fault & MAX31865_FAULT_LOWTHRESH) {
-        Serial.println("RTD Low Threshold"); 
-      }
-      if (fault & MAX31865_FAULT_REFINLOW) {
-        Serial.println("REFIN- > 0.85 x Bias"); 
-      }
-      if (fault & MAX31865_FAULT_REFINHIGH) {
-        Serial.println("REFIN- < 0.85 x Bias - FORCE- open"); 
-      }
-      if (fault & MAX31865_FAULT_RTDINLOW) {
-        Serial.println("RTDIN- < 0.85 x Bias - FORCE- open"); 
-      }
+      // it seems switching the pump during heating may trigger voltage fault
       if (fault & MAX31865_FAULT_OVUV) {
         Serial.println("Under/Over voltage"); 
+      } else {
+        // deactivate on temp reading error
+        if (!isStandby) {
+          Serial.println("Temperature reading error, machine going into standby.");
+      
+          goIntoStandBy();
+        }
+        
+        Serial.print("Fault 0x"); Serial.println(fault, HEX);
+        if (fault & MAX31865_FAULT_HIGHTHRESH) {
+          Serial.println("RTD High Threshold"); 
+        }
+        if (fault & MAX31865_FAULT_LOWTHRESH) {
+          Serial.println("RTD Low Threshold"); 
+        }
+        if (fault & MAX31865_FAULT_REFINLOW) {
+          Serial.println("REFIN- > 0.85 x Bias"); 
+        }
+        if (fault & MAX31865_FAULT_REFINHIGH) {
+          Serial.println("REFIN- < 0.85 x Bias - FORCE- open"); 
+        }
+        if (fault & MAX31865_FAULT_RTDINLOW) {
+          Serial.println("RTDIN- < 0.85 x Bias - FORCE- open"); 
+        } 
       }
+      
       ptThermo.clearFault();
     } else {
       // get temperature
