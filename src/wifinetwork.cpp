@@ -28,6 +28,6 @@ WiFiNetwork::WiFiNetwork(String ssid, int rssi, int channel, byte encryptionType
   } else if (rssi < -65) {
     Reception = "ok";
   } else {
-    Reception = "poor";
+    Reception = "good";
   }
 }
