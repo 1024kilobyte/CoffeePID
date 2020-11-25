@@ -1,20 +1,42 @@
 #!/bin/sh
+
+gzip='gzip -k --force'
+purgecss='purgecss --content *.html js/*.js --output css_prg'
+
+optimize() {
+  file="$1".min.css
+  [ ! -f css/"$file" ] && file="$1".css
+  opt_file="$1".opt.css
+
+  $purgecss --css css/"$file"
+  uglifycss css_prg/"$file" > css_prg/"$opt_file"
+  $gzip css_prg/"$opt_file"
+  mv -f css_prg/"$opt_file" css
+  mv -f css_prg/"$opt_file".gz css
+}
+
+minify() {
+  file=js/"$1".js
+  min_file=js/"$1".min.js
+
+  uglifyjs "$file" > "$min_file"
+  $gzip "$min_file"
+}
+
+
 cd data/www
 # purge css, minify, gzip
 mkdir css_prg
-purgecss --css css/bs4.min.css --content '*.html','js/*.js' --output css_prg
-purgecss --css css/app.css --content '*.html','js/*.js' --output css_prg
-uglifycss css_prg/bs4.min.css > css_prg/bs4.opt.css
-uglifycss css_prg/app.css > css_prg/app.opt.css
-gzip css_prg/bs4.opt.css
-gzip css_prg/app.opt.css
-mv -f css_prg/bs4.opt.css.gz css/bs4.opt.css.gz
-mv -f css_prg/app.opt.css.gz css/app.opt.css.gz
+optimize bs4
+optimize chartist
+optimize app
 rm -rf css_prg
+
 # minify all js files
-uglifyjs js/app.js > js/app.min.js
-gzip --force js/app.min.js
-# uglifyjs js/content.js > js/content.min.js
-gzip --force js/content.js
+minify app
+#minify content
+minify ws
+$gzip js/content.js
+
 # zip all html files
-gzip --force *.html
+$gzip *.html

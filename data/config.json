@@ -4,5 +4,10 @@
     "wifi_client_password": "",
     "wifi_ap_ssid": "CoffeePID",
     "wifi_ap_password": "coffeepid",
-    "target_temp": 98.0
+    "target_temp": 98.0,
+    "pid_kp": 5.0,
+    "pid_ki": 0.0,
+    "pid_kd": 0.0,
+    "pid_dt": 100,
+    "pwm_period": 2000
 }

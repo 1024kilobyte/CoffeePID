@@ -18,10 +18,20 @@
 
 // wifi stuff
 #include <ESP8266WiFi.h>
-#include "wifinetwork.h"
+#include "src/wifinetwork.h"
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 
 // webserver component
 #include <ESP8266WebServer.h>
+
+//!!!!!!!!!!!!!!!!!!!
+//!!!! WebSocket library - https://github.com/Links2004/arduinoWebSockets
+//!!!! IMPORTANT !!!! - in WebSockets.h - #define NETWORK_ESP8266 should be NETWORK_ESP8266_ASYNC
+//!!!! otherwise the loop may be blocked when the client loses the connection
+//!!!! this will require ESPAsyncTCP library - "https://github.com/me-no-dev/ESPAsyncTCP"
+//!!!!!!!!!!!!!!!!!!!
+#include <WebSocketsServer.h>
 
 // mdns component
 #include <ESP8266mDNS.h>
@@ -31,19 +41,40 @@
 
 // LittleFS
 #include <LittleFS.h>
-// MAX31865 library
-#include <Adafruit_MAX31865.h>
+// MAX31865 library with changes for autoConvert mode
+#include "src/Adafruit_MAX31865_library/Adafruit_MAX31865.h"
 
+#define PT1000 (1)
+#define PT100  (2)
+#define RTD PT1000
+//#define USE_MAX_DRDY  //uncomment this to use autoConvert mode of MAX31865 with DRDY pin
+
+#if(RTD == PT1000) 
 // pt1000 constants
-#define PT1000_RNOM     1000.0
-#define PT1000_RREF     4300.0
+#define RTD_RNOM     1000.0
+#define RTD_RREF     4300.0
+#define NUM_WIRES    MAX31865_2WIRE
+#else
+// pt100 constants
+#define RTD_RNOM     100.0
+#define RTD_RREF     430.0
+#define NUM_WIRES    MAX31865_3WIRE
+#endif
+
+#include "src/TemperatureHistory.h"
+TemperatureHistoryBuffer TemperatureHistory(60 * 60);  //60 min
+MeanBuffer<float> heaterPowerLog(30); //to calculate average output power for last 30*pwm_period sec
+
+// upper limit for temperature
+#define TEMPERATURE_UPPER_LIMIT 130
 
 // standby after 30 minutes
 #define STANDBY_TIMEOUT 1800000
 
 // declare webserver instance
 ESP8266WebServer server(80);
-
+WebSocketsServer webSocket = WebSocketsServer(81);
+                     
 // hardware pinout
 int relayPin = 0; // D3
 
@@ -51,9 +82,30 @@ int maxCLK = 14; // D5
 int maxSDO = 12; // D6
 int maxSDI = 13; // D7
 int maxCS = 4;   // D2
+int maxDRDY = 5; // D1
 
 // declare max31865 instance
 Adafruit_MAX31865 ptThermo = Adafruit_MAX31865(maxCS, maxSDI, maxSDO, maxCLK);
+
+// Low Frequency PWM
+// based on https://github.com/AlexGyver/GyverLibs - PWMrelay
+#include "src/PWMrelay.h"
+PWMrelay heater(relayPin, HIGH);
+
+// PID
+#define TUNE_IDLE   0
+#define TUNE_START  1
+#define TUNE_STOP   2
+int pidTunerState = 0;
+String pidTunerStateStr;
+
+// using  https://github.com/br3ttb/Arduino-PID-Library.git with some modifications
+// and https://github.com/br3ttb/Arduino-PID-AutoTune-Library.git  for autotune
+#include "src/Arduino-PID-Library/PID_v1.h"
+//Define Variables we'll be connecting to
+double pidSetpoint, pidInput, pidOutput;
+//Specify the links and initial tuning parameters
+PID regulator(&pidInput, &pidOutput, &pidSetpoint, 0, 0, 0, DIRECT);
 
 // internal state variables
 bool isHeating = false;
@@ -62,15 +114,20 @@ bool isStandby = false;
 // configuration values
 String global_preferred_wifi_mode;
 String global_wifi_client_ssid, global_wifi_client_password, global_wifi_ap_ssid, global_wifi_ap_password;
-float global_target_temp, global_current_temp;
+float global_target_temp;
+float global_pid_kp, global_pid_ki, global_pid_kd; 
+int16_t global_pid_dt;
+int global_pwm_period;
 
-// temp history buffer
-float temp_history[5];
-int current_history_index = 0;
+float global_current_temp, global_current_temp_f;
+Median3Buffer<float> median3Filter; //to calculate median for last 3 measurements of temperature;
+
+uint8_t globalFaultCode = 0; 
+String globalErrString = "";
 
 // loop control timestamps
 unsigned long measure_time = 0;
-unsigned long next_action_time = 0;
+unsigned long last_measure_time = 0;
 
 // *********
 // * SETUP *
@@ -93,6 +150,9 @@ void setup() {
   Serial.println("  WiFi Client | SSID: " + global_wifi_client_ssid + " | Length: " + global_wifi_client_ssid.length());
   Serial.println("  Password: " + global_wifi_client_password + " | Length: " + global_wifi_client_password.length());
   Serial.println("  Brewing Temp: " + String(global_target_temp));
+  
+  Serial.printf("  PID: (%.1f, %.1f, %.1f, %d)\n\r", global_pid_kp, global_pid_ki, global_pid_kd, global_pid_dt);
+  Serial.printf("  PWM period: %d\n\r", global_pwm_period);
 
   if (global_preferred_wifi_mode == "client") {
     if (global_wifi_client_ssid.length() > 0 && global_wifi_client_password.length() > 0) {
@@ -168,6 +228,9 @@ void setup() {
     Serial.println("* mDNS responder started");
   }
 
+  // setup OTA
+  setupOTA();
+
   // configure and start webserver
   // register root
   server.on("/", handleRoot);
@@ -189,12 +252,37 @@ void setup() {
   // add service to mDNS service discovery
   MDNS.addService("http", "tcp", 80);
 
+  // Start WebSocket server and assign callback
+  webSocket.begin();
+  webSocket.onEvent(onWebSocketEvent);
+
   // init relay pin
-  pinMode(relayPin, OUTPUT);
-  digitalWrite(relayPin, LOW);
+  heater.setLevel(HIGH);  
+  global_pwm_period = max(global_pwm_period, 1000);
+  heater.setPeriod(global_pwm_period);
+  heaterPowerLog.fill(0);
+  
+  regulator.SetTunings(global_pid_kp, global_pid_ki, global_pid_kd);
+  regulator.SetSampleTime(max(global_pid_dt, (int16_t)100)); //sets the period, in Milliseconds
+  regulator.SetOutputLimits(0, 100);  //for PWM
+  pidSetpoint = global_target_temp;
+  //turn the PID on
+  regulator.SetMode(AUTOMATIC);
 
   // init MAX31865 controller
-  ptThermo.begin(MAX31865_2WIRE);
+  pinMode(maxDRDY, INPUT);
+  ptThermo.begin(NUM_WIRES);
+  ptThermo.enable50Hz(true);
+  global_current_temp = ptThermo.temperature(RTD_RNOM, RTD_RREF);
+  global_current_temp_f = global_current_temp;
+#ifdef USE_MAX_DRDY
+  ptThermo.enableBias(true); //required for autoConvert
+  ptThermo.autoConvert(true);
+#endif
+  median3Filter.fill(global_current_temp);
+
+  TemperatureHistory.setNextTime();
+  last_measure_time = millis();
 
   // finished
   Serial.println("********************************");
@@ -206,142 +294,210 @@ void setup() {
   Serial.println("* boot completed after " + String(bootTime / 1000.0) + " seconds");
 }
 
+void setupOTA() {
+  // Port defaults to 8266
+  // ArduinoOTA.setPort(8266);
+
+  // Hostname defaults to esp8266-[ChipID]
+  // ArduinoOTA.setHostname("myesp8266");
+
+  // No authentication by default
+  // ArduinoOTA.setPassword("admin");
+
+  // Password can be set with it's md5 value as well
+  // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
+  // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
+
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else { // U_FS
+      type = "filesystem";
+    }
+
+    // NOTE: if updating FS this would be the place to unmount FS using FS.end()
+    LittleFS.end();
+    goIntoStandBy("OTA started");
+    
+    Serial.println("Start updating " + type);
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("Auth Failed");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("Begin Failed");
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("Connect Failed");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("Receive Failed");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("End Failed");
+    }
+  });
+  ArduinoOTA.begin();
+  Serial.println("OTA Ready");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
 // *************
 // * MAIN LOOP *
 // *************
 void loop() {
+  unsigned long current_time = millis();
+
   // ************
   // TEMP READING - updates the temp value
   // ************
-  unsigned long current_time = millis();
 
-  if (current_time >= measure_time) {
-    // check and print any faults
-    uint8_t fault = ptThermo.readFault();
-    if (fault) {
-      // it seems switching the pump during heating may trigger voltage fault
-      if (fault & MAX31865_FAULT_OVUV) {
-        Serial.println("Under/Over voltage"); 
-      } else {
-        // deactivate on temp reading error
-        if (!isStandby) {
-          Serial.println("Temperature reading error, machine going into standby.");
-      
-          goIntoStandBy();
-        }
-        
-        Serial.print("Fault 0x"); Serial.println(fault, HEX);
-        if (fault & MAX31865_FAULT_HIGHTHRESH) {
-          Serial.println("RTD High Threshold"); 
-        }
-        if (fault & MAX31865_FAULT_LOWTHRESH) {
-          Serial.println("RTD Low Threshold"); 
-        }
-        if (fault & MAX31865_FAULT_REFINLOW) {
-          Serial.println("REFIN- > 0.85 x Bias"); 
-        }
-        if (fault & MAX31865_FAULT_REFINHIGH) {
-          Serial.println("REFIN- < 0.85 x Bias - FORCE- open"); 
-        }
-        if (fault & MAX31865_FAULT_RTDINLOW) {
-          Serial.println("RTDIN- < 0.85 x Bias - FORCE- open"); 
-        } 
-      }
-      
-      ptThermo.clearFault();
-    } else {
-      // get temperature
-      global_current_temp = ptThermo.temperature(PT1000_RNOM, PT1000_RREF);
-  
-      // save value in "ring buffer"
-      temp_history[current_history_index] = global_current_temp;
-      current_history_index = current_history_index + 1;
-      current_history_index = current_history_index % 5;
-      
-      Serial.println(String(global_current_temp));
+  if (current_time - last_measure_time > 5000) {
+    goIntoStandBy("No temperature data for 5 sec");
+  }
+
+  // check and print any faults
+  uint8_t fault = ptThermo.readFault();
+  if (fault) {
+    // it seems switching the pump during heating may trigger voltage fault
+    if (fault & MAX31865_FAULT_OVUV) {
+      Log("error", "Under/Over voltage");
     }
+    else {
+      globalFaultCode = fault;
 
+      // deactivate on temp reading error
+      if (!isStandby) {
+        goIntoStandBy("Temperature reading error");
+      }
+      Log("error", "Fault 0x%02x", (int)fault);
+      if (fault & MAX31865_FAULT_HIGHTHRESH) {
+        Log("error", "RTD High Threshold");
+      }
+      if (fault & MAX31865_FAULT_LOWTHRESH) {
+        Log("error", "RTD Low Threshold");
+      }
+      if (fault & MAX31865_FAULT_REFINLOW) {
+        Log("error", "REFIN- > 0.85 x Bias");
+      }
+      if (fault & MAX31865_FAULT_REFINHIGH) {
+        Log("error", "REFIN- < 0.85 x Bias - FORCE- open");
+      }
+      if (fault & MAX31865_FAULT_RTDINLOW) {
+        Log("error", "RTDIN- < 0.85 x Bias - FORCE- open");
+      }
+    }
+    ptThermo.clearFault();
+  }
+
+#ifdef USE_MAX_DRDY
+  constexpr float FILTER_COEF = 0.02;
+  if (digitalRead(maxDRDY) == LOW) {  //measurement result is ready	    
+    global_current_temp = ptThermo.temperature_nowait(RTD_RNOM, RTD_RREF); //~ 20ms between measurements
+#else
+  constexpr float FILTER_COEF = 0.1;  
+  if (current_time >= measure_time) {
+    global_current_temp = ptThermo.temperature(RTD_RNOM, RTD_RREF);     //~ 75ms per one measurement, blocking
+#endif
+
+    //median filter then smoothing filter (EMA)
+    median3Filter.push_back(global_current_temp);
+    global_current_temp_f = median3Filter.getMedian() * FILTER_COEF + global_current_temp_f * (1 - FILTER_COEF);
+
+    // *******
+    // CONTROL
+    // *******
+    // set the heater according to the regulator
+    pidInput = global_current_temp_f;
+    regulator.Compute();
+    if (!isStandby) heater.setPWM(pidOutput);
+    //Log5000("regulator", "temp: %.2f, output:%.2f     %.2f,   %.2f,   %.2f   ", global_current_temp_f, pidOutput,
+    //	regulator.GetProportional(), regulator.GetIntegral(), regulator.GetDerivative());
+
+    // tune pid if started
+    tune_pid_loop();
+
+    last_measure_time = current_time;
+#ifndef USE_MAX_DRDY
     measure_time = millis() + 75;
+#endif
   }
-  
-  // **********************
-  // OVERHEATING PROTECTION - don't heat past target temp + 3°C or 130°C
-  // **********************
-  if ((global_current_temp > 130 || global_current_temp > (global_target_temp + 3.0)) && isHeating) {
-    isHeating = false;
-    digitalWrite(relayPin, LOW);
 
+  // **********************
+  // OVERHEATING PROTECTION - don't heat past 130°C
+  // **********************
+  if (global_current_temp_f > TEMPERATURE_UPPER_LIMIT) {
+    heater.setPWM(0);
+    isHeating = false;
     Serial.println("Over temperature protection active");
-    next_action_time = millis() + 5000;
   }
-  
+
   // *******
   // STANDBY - after STANDBY_TIMEOUT esp runtime (in ms)
   // *******
-  if (!isStandby && millis() > STANDBY_TIMEOUT) {
-    Serial.println("Maximum power on timer elapsed, machine going into standby.");
-    
-    goIntoStandBy();
-  }
-
-  // *******
-  // CONTROL
-  // *******
-  if (millis() > next_action_time) {
-    // get temp incline from buffer
-    float oldest_history_value, latest_history_value; 
-
-    if (current_history_index == 0) {
-      latest_history_value = temp_history[4];
-    } else {
-      latest_history_value = temp_history[current_history_index - 1];
-    }
-
-    oldest_history_value = temp_history[current_history_index];
-
-    float delta_temp = latest_history_value - oldest_history_value;
-
-    // finally control the heater
-    if (isHeating) {
-      isHeating = false;
-      digitalWrite(relayPin, LOW);
-
-      // Serial.println(String(global_current_temp) + "°C, switching off");
-
-      // calculate relaxation time 
-      int relaxationTime = 5000 + delta_temp * 1000;
-      
-      next_action_time = millis() + relaxationTime;
-    } else {
-      float heating_start_delta = global_target_temp - global_current_temp;
-      double heating_duration = heating_start_delta * 1100 + delta_temp * -9000;
-
-      // Serial.println("heating for " + String(heating_duration) + " ms");
-
-      // skip heating if duration is negative or too short
-      if (heating_duration > 150) {              
-        isHeating = true;
-        digitalWrite(relayPin, HIGH);
-        
-        next_action_time = millis() + heating_duration; 
-      } else {
-        // just don't set the next action time and check again in next loop
-      }
-    }
+  if (!isStandby && current_time > STANDBY_TIMEOUT) {
+    goIntoStandBy("Maximum power on timer elapsed");
   }
 
   // *********
   // FAST LOOP - executed with every loop cycle
   // *********
+
+  // let PWM do the job
+  heater.tick();
+  logPower(current_time);
+  isHeating = heater.isActive();
+
+  // broadcast state to all clients
+  sendState();
+
   // help the esp to do its other tasks (wifi connections, aso.)
   delay(0);
-  
+
   // update mdns
   MDNS.update();
-  
+
+  // Look for and handle WebSocket data
+  webSocket.loop();
+
   // handle webserver requests
   server.handleClient();
+
+  // handle OTA
+  ArduinoOTA.handle();
+
+  // save temperature history
+  TemperatureHistory.loop();
 }
+
+void logPower(unsigned long current_time) {
+  static bool isHeatingPrev = false;
+  bool isHeatingNow = heater.isActive();
+  static unsigned long lastOn = 0, lastOff = 0, lastWrite = 0;
+  if (isHeatingNow != isHeatingPrev || (current_time - lastWrite) > global_pwm_period) {
+    if (isHeatingNow == isHeatingPrev) {
+      heaterPowerLog.push_back(isHeatingNow ? 1.0 : 0.0); //long stable state
+      if (isHeatingNow) lastOn = current_time;
+      else lastOff = lastOn; //to set power to 0 whith next change to On
+    }
+    else {
+      if (isHeatingNow) {
+        heaterPowerLog.push_back(static_cast<float>(lastOff - lastOn) / static_cast<float>(current_time - lastOn));
+        lastOn = current_time;
+      }
+      else lastOff = current_time;
+      isHeatingPrev = isHeatingNow;
+    }
+    lastWrite = current_time;
+  }
+}
+
 
 // ******************
 // * HTTP ENDPOINTS *
@@ -401,14 +557,40 @@ void handleWebRequests() {
 // * AJAX ENDPOINTS *
 // ******************
 void getTemp() {
-  server.send(200, "text/plain", String(global_target_temp) + "|" + String(global_current_temp) + "|" + String(isHeating) + "|" + String(millis()) + "|" + String(isStandby));
+  server.send(200, "text/plain", String(global_target_temp) + "|" + 
+                                 String(global_current_temp_f) + "|" + 
+                                 String(isHeating) + "|" + 
+                                 String(millis()) + "|" + 
+                                 String(isStandby));
 }
 
 void getConfig() {
-  server.send(200, "text/json", "{ \"preferred_wifi_mode\": \"" + String(global_preferred_wifi_mode) + "\", \"wifi_ap_ssid\": \"" + String(global_wifi_ap_ssid) + "\", \"wifi_ap_password\": \"" + String(global_wifi_ap_password) + "\", \"wifi_client_ssid\": \"" + String(global_wifi_client_ssid) + "\", \"target_temp\": \"" + String(global_target_temp) + "\" }");
+  // Allocate the JsonDocument
+  StaticJsonDocument<512> doc;
+  
+  doc["preferred_wifi_mode"] = global_preferred_wifi_mode;
+  doc["wifi_client_ssid"] = global_wifi_client_ssid;
+  doc["wifi_client_password"] = global_wifi_client_password;
+  doc["wifi_ap_ssid"] = global_wifi_ap_ssid;
+  doc["wifi_ap_password"] = global_wifi_ap_password;
+  doc["target_temp"] = global_target_temp;
+  doc["pid_kp"] = global_pid_kp;
+  doc["pid_ki"] = global_pid_ki;
+  doc["pid_kd"] = global_pid_kd;
+  doc["pid_dt"] = global_pid_dt;
+  doc["pwm_period"] = global_pwm_period; 
+
+  //Serial.println("getConfig: ");
+  //serializeJsonPretty(doc, Serial);
+
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+  server.send(200, "text/json", jsonPayload);
 }
 
 void setConfig() {
+  //Log("setConfig: ", server.arg("plain").c_str());
+
   // check for reboot
   if (server.arg("reboot").length() > 0) {
     bool reboot = server.arg("reboot") == "true";
@@ -447,9 +629,42 @@ void setConfig() {
 
   String target_temp = server.arg("target_temp");
   if (target_temp.length() > 0) {
-    global_target_temp = target_temp.toFloat();
+    global_target_temp = constrain(target_temp.toFloat(), 0, TEMPERATURE_UPPER_LIMIT);
+    pidSetpoint = global_target_temp;
   }
 
+  String str = server.arg("pid_kp");
+  if (str.length() > 0) {
+    global_pid_kp = str.toFloat();
+  }
+  str = server.arg("pid_ki");
+  if (str.length() > 0) {
+    global_pid_ki = str.toFloat();
+  }
+  str = server.arg("pid_kd");
+  if (str.length() > 0) {
+    global_pid_kd = str.toFloat();
+  }
+  regulator.SetTunings(global_pid_kp, global_pid_ki, global_pid_kd);
+
+  str = server.arg("pid_dt");
+  if (str.length() > 0) {
+    global_pid_dt = str.toInt();
+    global_pid_dt = max(global_pid_dt, (int16_t)100);
+    regulator.SetSampleTime(global_pid_dt);
+  }
+  str = server.arg("pwm_period");
+  if (str.length() > 0) {
+    global_pwm_period = str.toInt();
+    heater.setPeriod(global_pwm_period);
+  }
+  
+  str = server.arg("start_pid_tune");
+  if (str.length() > 0) {  //toggle tuner
+    pidTunerState = ((pidTunerState == TUNE_IDLE) ? TUNE_START : TUNE_STOP); 
+  }
+  else if(pidTunerState) pidTunerState = TUNE_STOP; //Stop pid tuner if running
+ 
   writeConfig();
 
   server.send(202);
@@ -457,54 +672,52 @@ void setConfig() {
 
 void getWifis() {
   byte numSsid = WiFi.scanNetworks();
+  if (numSsid == 255) numSsid = 0;
   WiFiNetwork networks[numSsid];
+  int len = 0;
 
   // print the network number and name for each network found:
   for (int wifiCounter = 0; wifiCounter < numSsid; wifiCounter++) {
     networks[wifiCounter] = WiFiNetwork(WiFi.SSID(wifiCounter), WiFi.RSSI(wifiCounter), WiFi.channel(wifiCounter), WiFi.encryptionType(wifiCounter));
-
+    len += networks[wifiCounter].SSID.length() + networks[wifiCounter].Reception.length() + networks[wifiCounter].Encryption.length();
     Serial.println(WiFi.SSID(wifiCounter) + " " + WiFi.encryptionType(wifiCounter));
   }
 
-  // "quick" sorting - as its around 1 ms in bad conditions, this is just fine
-  for (int sortRepeat = 0; sortRepeat < numSsid; sortRepeat++) {
-    for (int sortCounter = 0; sortCounter < numSsid-1; sortCounter++) {
-      if (networks[sortCounter].RSSI < networks[sortCounter+1].RSSI) {
-        WiFiNetwork tmpNetwork = networks[sortCounter];
-        networks[sortCounter] = networks[sortCounter+1];
-        networks[sortCounter+1] = tmpNetwork;
-      }
-    } 
-  }
-
-  String jsonPayload = "{ \"wifis\":[";
-
-  for (int index = 0; index < numSsid; index++) {
-    jsonPayload += "{ \"ssid\": \"" + networks[index].SSID + "\", \"channel\": " + String(networks[index].Channel) + ", \"rssi\": " + String(networks[index].RSSI) + ", \"reception\": \"" + networks[index].Reception + "\", \"encryption\": \"" + networks[index].Encryption + "\"}";
+  //uint32_t StartSortingTime = micros();
+  qsort(networks, sizeof(networks) / sizeof(networks[0]), sizeof(networks[0]),
+      [](const void* cmp1, const void* cmp2) {return (static_cast<const WiFiNetwork*>(cmp2))->RSSI - (static_cast<const WiFiNetwork*>(cmp1))->RSSI; }
+  );
+  //uint32_t EndSortingTime = micros();
+  //Log("qsort", "sorted at: %d microseconds", (int)(EndSortingTime - StartSortingTime));
+ 
+  const size_t capacity = JSON_ARRAY_SIZE(numSsid) + JSON_OBJECT_SIZE(1) + numSsid*JSON_OBJECT_SIZE(5) + len + 4;
+  DynamicJsonDocument doc(capacity);
   
-    if (index != numSsid-1) {
-      jsonPayload += ", ";  
-    }
+  JsonArray wifis = doc.createNestedArray("wifis");
+  for (int index = 0; index < numSsid; index++) {
+    JsonObject wifi = wifis.createNestedObject();
+    wifi["ssid"] = networks[index].SSID;
+    wifi["channel"] = networks[index].Channel;
+    wifi["rssi"] = networks[index].RSSI;
+    wifi["reception"] = networks[index].Reception;
+    wifi["encryption"] = networks[index].Encryption;
   }
 
-  jsonPayload += "]}";
-
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
   server.send(200, "text/json", jsonPayload);
 }
 
 // **********
 // * HELPER *
 // **********
-void goIntoStandBy() {
+void goIntoStandBy(String reason) {
   isStandby = true;
-
-  if (isHeating) {
-    isHeating = false;
-    digitalWrite(relayPin, LOW);
-  }
-
-  // stop heating at all
-  next_action_time = ULONG_MAX;
+  heater.setPWM(0); 
+  isHeating = false;
+  if (pidTunerState) pidTunerState = TUNE_STOP; //Stop pid tuner if running
+  globalErrString = reason;
+  Log("error", "%s, %s", reason.c_str(), "machine going into standby.");
 }
 
 void readConfig() {
@@ -513,32 +726,92 @@ void readConfig() {
   if (LittleFS.exists("/config.json")) {
     File config_file = LittleFS.open("/config.json", "r");
 
-    DynamicJsonDocument doc(512);
+    StaticJsonDocument<512> doc;
     deserializeJson(doc, config_file.readString());
-    
+    //serializeJsonPretty(doc, Serial);
+     
     config_file.close();
 
-    global_preferred_wifi_mode = (const char *) doc["preferred_wifi_mode"];
-    global_wifi_client_ssid = (const char *) doc["wifi_client_ssid"];
-    global_wifi_client_password = (const char *) doc["wifi_client_password"];
-    global_wifi_ap_ssid = (const char *) doc["wifi_ap_ssid"];
-    global_wifi_ap_password = (const char *) doc["wifi_ap_password"];
-    global_target_temp = (float) doc["target_temp"];
+    global_preferred_wifi_mode = doc["preferred_wifi_mode"].as<const char*>();
+    global_wifi_client_ssid = doc["wifi_client_ssid"].as<const char*>();
+    global_wifi_client_password = doc["wifi_client_password"].as<const char*>();
+    global_wifi_ap_ssid = doc["wifi_ap_ssid"].as<const char*>();
+    global_wifi_ap_password = doc["wifi_ap_password"].as<const char*>();
+    global_target_temp = doc["target_temp"].as<float>();
+    global_pid_kp = doc["pid_kp"].as<float>();
+    global_pid_ki = doc["pid_ki"].as<float>();
+    global_pid_kd = doc["pid_kd"].as<float>();
+    global_pid_dt = doc["pid_dt"].as<int16_t>();
+    global_pwm_period = doc["pwm_period"].as<int>();   
   }
 }
 
 void writeConfig() {
-  DynamicJsonDocument doc(512);
+  StaticJsonDocument<512> doc;
   doc["preferred_wifi_mode"] = global_preferred_wifi_mode;
   doc["wifi_client_ssid"] = global_wifi_client_ssid;
   doc["wifi_client_password"] = global_wifi_client_password;
   doc["wifi_ap_ssid"] = global_wifi_ap_ssid;
   doc["wifi_ap_password"] = global_wifi_ap_password;
   doc["target_temp"] = global_target_temp;
+  doc["pid_kp"] = global_pid_kp;
+  doc["pid_ki"] = global_pid_ki;
+  doc["pid_kd"] = global_pid_kd;
+  doc["pid_dt"] = global_pid_dt;
+  doc["pwm_period"] = global_pwm_period; 
 
   LittleFS.begin();
 
   File config_file = LittleFS.open("/config.json", "w+"); // Datei zum schreiben öffnen;
   serializeJson(doc, config_file);
+  
   config_file.close();
+  webSocket.broadcastTXT("{\"new_config\":true}");
+}
+
+void vLog(char *type, const char* format, va_list va)
+{
+  char buffer[512];
+  StaticJsonDocument<512> doc;
+  String jsonPayload;
+  
+  vsnprintf(buffer, sizeof(buffer), format, va);
+ 
+  doc["millis"] = millis();
+  doc[type] = buffer;
+  serializeJson(doc, jsonPayload);
+  webSocket.broadcastTXT(jsonPayload);
+  Serial.println(jsonPayload);
+}
+
+void Log(char *type, const char* format, ...)
+{
+  va_list va;
+  va_start(va, format);
+  vLog(type, format, va);
+  va_end(va);
+}
+
+void Log1000(char *type, const char* format, ...)
+{
+  static unsigned long nextMsg = 0;
+  if(millis() <= nextMsg) return;
+  
+  va_list va;
+  va_start(va, format);
+  vLog(type, format, va);
+  va_end(va);
+  nextMsg = millis() + 1000;
+}
+
+void Log5000(char *type, const char* format, ...)
+{
+  static unsigned long nextMsg = 0;
+  if(millis() <= nextMsg) return;
+  
+  va_list va;
+  va_start(va, format);
+  vLog(type, format, va);
+  va_end(va);
+  nextMsg = millis() + 5000;
 }

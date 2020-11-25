@@ -185,3 +185,26 @@ body {
 .custom-control-label{
   margin: 1.5rem 2rem;
 }
+
+/* purgecss start ignore */
+.ct-series-a .ct-line {
+    stroke: LightPink;
+    stroke-width: 3px;
+}
+.ct-series-b .ct-line {
+    stroke: red;
+}
+.ct-series-c .ct-line {
+    stroke: blue;
+}
+/* purgecss end ignore */
+
+.ct-target-line {
+    stroke: Brown;
+    stroke-width: 2px;
+    stroke-dasharray: 4px;
+}
+#chart1 {
+	border-radius: 6px;
+	background-color: Linen;
+}
