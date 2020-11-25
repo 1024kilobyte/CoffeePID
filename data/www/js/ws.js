@@ -48,15 +48,8 @@ function chkConnection() {
 
 // Called when a WebSocket connection is established with the server
 function onOpen(evt) {
-
     // Log connection state
     console.log("Connected");
-    	
- // Enable button
-    //button.disabled = false;
-    
-    // Get the current state of the LED
-    //doSend("getLEDState");
 }
 
 // Called when the WebSocket connection is closed
@@ -77,10 +70,7 @@ function onClose(evt) {
     $('#timerLabel').html('');
     currentPowerStr = '';
     $('#powerLabel').html(currentPowerStr);
-	
-    // Disable button
-    //button.disabled = true;
-    
+	   
     // Try to reconnect after a few seconds
     setTimeout(function() { wsConnect(url) }, 2000);
 }
@@ -104,8 +94,8 @@ function onMessage(evt) {
             let temperature = binaryFrontTemperature;
             let power = 0;
             let meanPower = 0;
-            let newData = temperatureData.filter(v => v.x < binaryFrontTime + espBootTime);  //left the old data
-            let newPowerData = powerData.filter(v => v.time < binaryFrontTime + espBootTime);
+            let newData = temperatureData.filter(tp => tp.x < binaryFrontTime + espBootTime);  //left the old data
+            let newPowerData = powerData.filter(pp => pp.time < binaryFrontTime + espBootTime);
 
             for (let i = 0; i < buffer.length; i += 5) {
                 time += (buffer[i] & 0xFF) + ((buffer[i + 1] & 0xFF) << 8);  //unsigned int
@@ -143,17 +133,15 @@ function onMessage(evt) {
         $('#state-circle').removeClass('heating-on');
         //$('#state-circle').removeClass('cool-off');
 
-        if (obj.heater) {
+        if (obj.heater.on) {
             $('#state-circle').addClass('heating-on');
         }
         //else {
         //$('#state-circle').addClass('cool-off');
         //}
-        if (obj.power !== undefined) {
-            currentPowerStr = (obj.power).toFixed(1) + '%';
-            $('#powerLabel').html(currentPowerStr);
-            //$('#powerLabel').prop('hidden', false);
-        }
+        currentPowerStr = (obj.heater.power).toFixed(1) + '%';
+        $('#powerLabel').html(currentPowerStr);
+        //$('#powerLabel').prop('hidden', false);
     }
 
     if (obj.temperature !== undefined) {

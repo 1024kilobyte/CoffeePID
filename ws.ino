@@ -61,14 +61,15 @@ void sendState() {
   unsigned long time = millis();
   
   if (time >= nextHeaterStatusSendTime || isHeating != lastHeatingState) { //send heater state and power
-    doc["heater"] = isHeating;
+    JsonObject heater = doc.createNestedObject("heater");
+    heater["on"] = isHeating;
     float power;
     if (heaterPowerLog.getStdDev() > 0.05) power = heaterPowerLog.back();
     else power = heaterPowerLog.getMean();
     power *= 100;
     if (power < 0.01) power = 0;
     if (power > 99.99) power = 100;
-    doc["power"] = power;
+    heater["power"] = power;
     nextHeaterStatusSendTime = time + HEATER_IDLE_SEND_INTERVAL;
     lastHeatingState = isHeating;
   }
