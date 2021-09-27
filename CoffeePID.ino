@@ -1,3 +1,5 @@
+
+
 /*   _____       __  __          _____ _____ _____  
  *  / ____|     / _|/ _|        |  __ \_   _|  __ \ 
  * | |     ___ | |_| |_ ___  ___| |__) || | | |  | |
@@ -8,7 +10,7 @@
  * A user-friendly IoT temperature regulator for your
  * coffee machine. This setup is based on:
  * - an ESP8266 microcontroller board
- * - MAX31865 with a PT1000 thermo element
+ * - MAX31865 with a PT100 thermo element
  * - an SSR-25DA relay (pin variable "relayPin")
  * - an 3,3 V power supply for the esp
  * 
@@ -17,40 +19,40 @@
  */
 
 // wifi stuff
-#include <ESP8266WiFi.h>
-#include "wifinetwork.h"
+#include <WiFi.h>
 
 // webserver component
-#include <ESP8266WebServer.h>
+#include <WebServer.h>
 
 // mdns component
-#include <ESP8266mDNS.h>
+#include <ESPmDNS.h>
+
+// LittleFS
+#include <LittleFS.h>
 
 // JSON library
 #include <ArduinoJson.h>
 
-// LittleFS
-#include <LittleFS.h>
 // MAX31865 library
 #include <Adafruit_MAX31865.h>
 
-// pt1000 constants
-#define PT1000_RNOM     1000.0
-#define PT1000_RREF     4300.0
+// pt100 constants
+#define PT100_RNOM     100.0
+#define PT100_RREF     430.0
 
 // standby after 30 minutes
 #define STANDBY_TIMEOUT 1800000
 
 // declare webserver instance
-ESP8266WebServer server(80);
+WebServer server(80);
 
 // hardware pinout
-int relayPin = 0; // D3
+int relayPin = 21; // D3
 
-int maxCLK = 14; // D5 
-int maxSDO = 12; // D6
-int maxSDI = 13; // D7
-int maxCS = 4;   // D2
+int maxCS =  15; 
+int maxSDI = 23;
+int maxSDO = 19;
+int maxCLK = 18;
 
 // declare max31865 instance
 Adafruit_MAX31865 ptThermo = Adafruit_MAX31865(maxCS, maxSDI, maxSDO, maxCLK);
@@ -71,6 +73,7 @@ int current_history_index = 0;
 // loop control timestamps
 unsigned long measure_time = 0;
 unsigned long next_action_time = 0;
+
 
 // *********
 // * SETUP *
@@ -98,7 +101,8 @@ void setup() {
     if (global_wifi_client_ssid.length() > 0 && global_wifi_client_password.length() > 0) {
       // Wifi client mode
       WiFi.mode(WIFI_STA);
-      WiFi.begin(global_wifi_client_ssid, global_wifi_client_password);
+      WiFi.begin("ktnnet", "4165563472");
+      //WiFi.begin(global_wifi_client_ssid, global_wifi_client_password);
       Serial.print("* Connecting to \"" + global_wifi_client_ssid + "\" ");
   
       int waitCounter = 0;
@@ -157,7 +161,7 @@ void setup() {
     
     // access point mode
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(global_wifi_ap_ssid, global_wifi_ap_password);
+    WiFi.softAP("CoffeePID", "coffeepid");
     Serial.println("* Started accesspoint \"" + global_wifi_ap_ssid +"\" with password \"" + global_wifi_ap_password + "\"");
   }
 
@@ -192,7 +196,10 @@ void setup() {
   // init relay pin
   pinMode(relayPin, OUTPUT);
   digitalWrite(relayPin, LOW);
-
+  delay(1500);
+  digitalWrite(relayPin, HIGH);
+  delay(1500);
+  
   // init MAX31865 controller
   ptThermo.begin(MAX31865_2WIRE);
 
@@ -251,7 +258,7 @@ void loop() {
       ptThermo.clearFault();
     } else {
       // get temperature
-      global_current_temp = ptThermo.temperature(PT1000_RNOM, PT1000_RREF);
+      global_current_temp = ptThermo.temperature(PT100_RNOM, PT100_RREF);
   
       // save value in "ring buffer"
       temp_history[current_history_index] = global_current_temp;
@@ -316,10 +323,11 @@ void loop() {
       float heating_start_delta = global_target_temp - global_current_temp;
       double heating_duration = heating_start_delta * 1100 + delta_temp * -9000;
 
-      // Serial.println("heating for " + String(heating_duration) + " ms");
+       Serial.println("heating duration is: " + String(heating_duration) + " ms.  Turning on relay pin: " + relayPin); 
 
       // skip heating if duration is negative or too short
-      if (heating_duration > 150) {              
+      if (heating_duration > 150) {
+        Serial.println("heating for " + String(heating_duration) + " ms.  Turning on relay pin: " + relayPin);              
         isHeating = true;
         digitalWrite(relayPin, HIGH);
         
@@ -335,9 +343,6 @@ void loop() {
   // *********
   // help the esp to do its other tasks (wifi connections, aso.)
   delay(0);
-  
-  // update mdns
-  MDNS.update();
   
   // handle webserver requests
   server.handleClient();
@@ -457,32 +462,14 @@ void setConfig() {
 
 void getWifis() {
   byte numSsid = WiFi.scanNetworks();
-  WiFiNetwork networks[numSsid];
-
-  // print the network number and name for each network found:
-  for (int wifiCounter = 0; wifiCounter < numSsid; wifiCounter++) {
-    networks[wifiCounter] = WiFiNetwork(WiFi.SSID(wifiCounter), WiFi.RSSI(wifiCounter), WiFi.channel(wifiCounter), WiFi.encryptionType(wifiCounter));
-
-    Serial.println(WiFi.SSID(wifiCounter) + " " + WiFi.encryptionType(wifiCounter));
-  }
-
-  // "quick" sorting - as its around 1 ms in bad conditions, this is just fine
-  for (int sortRepeat = 0; sortRepeat < numSsid; sortRepeat++) {
-    for (int sortCounter = 0; sortCounter < numSsid-1; sortCounter++) {
-      if (networks[sortCounter].RSSI < networks[sortCounter+1].RSSI) {
-        WiFiNetwork tmpNetwork = networks[sortCounter];
-        networks[sortCounter] = networks[sortCounter+1];
-        networks[sortCounter+1] = tmpNetwork;
-      }
-    } 
-  }
 
   String jsonPayload = "{ \"wifis\":[";
 
-  for (int index = 0; index < numSsid; index++) {
-    jsonPayload += "{ \"ssid\": \"" + networks[index].SSID + "\", \"channel\": " + String(networks[index].Channel) + ", \"rssi\": " + String(networks[index].RSSI) + ", \"reception\": \"" + networks[index].Reception + "\", \"encryption\": \"" + networks[index].Encryption + "\"}";
-  
-    if (index != numSsid-1) {
+  // print the network number and name for each network found:
+  for (int wifiCounter = 0; wifiCounter < numSsid; wifiCounter++) {
+    Serial.println(WiFi.SSID(wifiCounter) + " " + WiFi.encryptionType(wifiCounter));
+    jsonPayload += "{\"ssid\": \"" + String(WiFi.SSID(wifiCounter)) + "\", \"channel\": \"" + String(WiFi.channel(wifiCounter)) + "\", \"rssi\": \"" + String(WiFi.RSSI(wifiCounter)) + "\", \"encryption\": \"" + String(WiFi.encryptionType(wifiCounter)) + "\"}";
+    if (wifiCounter != numSsid-1) {
       jsonPayload += ", ";  
     }
   }
